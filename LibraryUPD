@@ -1,0 +1,365 @@
+if VynixuEntitySpawnerV2 then return VynixuEntitySpawnerV2 end
+
+-- Services
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+
+-- Variables
+local localPlayer = Players.LocalPlayer
+local localChar = localPlayer.Character or localPlayer.CharacterAdded:Wait()
+local localHum = localChar:WaitForChild("Humanoid")
+local localRoot = localChar:WaitForChild("HumanoidRootPart")
+local localCamera = workspace.CurrentCamera
+local playerGui = localPlayer:WaitForChild("PlayerGui")
+local gameStats = ReplicatedStorage:WaitForChild("GameStats")
+local gameData = ReplicatedStorage:WaitForChild("GameData")
+local floorReplicated = ReplicatedStorage:WaitForChild("FloorReplicated")
+local remotesFolder = ReplicatedStorage:WaitForChild("RemotesFolder")
+
+local lastRespawn
+local BaseEntitySpeed = 65
+
+local vynixuModules = {
+    Functions = loadstring(game:HttpGet("https://raw.githubusercontent.com/RegularVynixu/Utilities/main/Functions.lua"))()
+}
+
+local moduleScripts = {
+    Module_Events = require(ReplicatedStorage.ModulesClient.Module_Events),
+    Main_Game = require(playerGui.MainUI.Initiator.Main_Game),
+}
+
+local defaultEntityAttributes = {
+    Running = false,
+    CustomEntity = true,
+    Paused = false,
+    BeingBanished = false,
+    Despawning = false,
+    Damage = true,
+    LastEnteredRoom = -1
+}
+
+local defaultPlayerAttributes = {
+    SpawnProtection = 5
+}
+
+local defaultDebug = {
+    OnSpawned = function() end,
+    OnStartMoving = function() end,
+    OnReachedNode = function() end,
+    OnEnterRoom = function() end,
+    OnLookAt = function() end,
+    OnRebounding = function() end,
+    OnDespawning = function() end,
+    OnDespawning = function() end,
+    OnDamagePlayer = function() end,
+}
+
+local defaultConfig = {
+    Entity = {
+        Name = "Template Entity",
+        Asset = "https://github.com/RegularVynixu/Utilities/blob/main/Doors%20Entity%20Spawner/Models/Rush.rbxm?raw=true",
+        HeightOffset = 0
+    },
+    Movement = {
+        Speed = 100,
+        Delay = 2,
+        Reversed = false
+    },
+    Damage = {
+        Enabled = true,
+        Range = 40,
+        Amount = 125
+    },
+    CameraShake = {
+        Enabled = true,
+        Values = {1.5, 20, 0.1, 1},
+        Range = 100
+    },
+    Death = {
+        Type = "Guiding",
+        Hints = {"Death", "Hints", "Go", "Here"},
+        Cause = ""
+    }
+}
+
+local ambientStorage = {}
+local spawner = {}
+
+-- Functions
+function CloneTable(tbl)
+    local cloned = {}
+    for key, value in pairs(tbl) do
+        if typeof(value) == "table" then
+            cloned[key] = CloneTable(value)
+        else
+            cloned[key] = value
+        end
+    end
+    return cloned
+end
+
+function OnCharacterAdded(char)
+    lastRespawn = tick()
+    localChar = char
+    localHum = char:WaitForChild("Humanoid")
+    localRoot = char:WaitForChild("HumanoidRootPart")
+end
+
+function GetCurrentRoom(latest)
+    if latest then
+        return workspace.CurrentRooms:GetChildren()[#workspace.CurrentRooms:GetChildren()]
+    end
+    return workspace.CurrentRooms:FindFirstChild(localPlayer:GetAttribute("CurrentRoom"))
+end
+
+-- НОВАЯ ФУНКЦИЯ: Поиск всех нодов в комнате (RoomEntrance, RoomExit и PathfindNodes)
+function GetRoomNodes(room, reversed)
+    local nodes = {}
+    
+    -- Добавляем RoomEntrance как первую ноду
+    local roomEntrance = room:FindFirstChild("RoomEntrance")
+    if roomEntrance then
+        table.insert(nodes, {
+            CFrame = roomEntrance.CFrame - Vector3.new(0, 3, 0),  -- Опускаем на уровень пола
+            Name = "RoomEntrance"
+        })
+    end
+    
+    -- Добавляем RoomExit как последнюю ноду
+    local roomExit = room:FindFirstChild("RoomExit")
+    if roomExit then
+        table.insert(nodes, {
+            CFrame = roomExit.CFrame - Vector3.new(0, 3, 0),  -- Опускаем на уровень пола
+            Name = "RoomExit"
+        })
+    end
+    
+    -- Ищем папку PathfindNodes и добавляем все её содержимое как ноды
+    local pathfindNodes = room:FindFirstChild("PathfindNodes")
+    if pathfindNodes then
+        -- Рекурсивно ищем все части в папке PathfindNodes
+        local function findPartsInFolder(folder)
+            for _, child in ipairs(folder:GetChildren()) do
+                if child:IsA("BasePart") then
+                    table.insert(nodes, {
+                        CFrame = child.CFrame,
+                        Name = child.Name
+                    })
+                elseif child:IsA("Folder") or child:IsA("Model") then
+                    findPartsInFolder(child)  -- Рекурсивный поиск во вложенных папках
+                end
+            end
+        end
+        
+        findPartsInFolder(pathfindNodes)
+    end
+    
+    -- Сортируем ноды по имени (чтобы соблюсти порядок 1, 2, 3...)
+    table.sort(nodes, function(a, b)
+        return a.Name < b.Name
+    end)
+    
+    -- Если нужен обратный порядок, переворачиваем массив
+    if reversed then
+        local reversedNodes = {}
+        for i = #nodes, 1, -1 do
+            table.insert(reversedNodes, nodes[i])
+        end
+        return reversedNodes
+    end
+    
+    return nodes
+end
+
+-- ОБНОВЛЕННАЯ ФУНКЦИЯ: Получение пути для движения сущности
+function GetPathfindNodes(config)
+    local pathfindNodes = {}
+    local rooms = workspace.CurrentRooms:GetChildren()
+    
+    if config.Movement.Reversed then
+        -- Обратный порядок: от последней комнаты к первой
+        for i = #rooms, 1, -1 do
+            local room = rooms[i]
+            local roomNodes = GetRoomNodes(room, true) -- reversed=true для обратного порядка в комнате
+            for _, node in ipairs(roomNodes) do
+                table.insert(pathfindNodes, node)
+            end
+        end
+    else
+        -- Прямой порядок: от первой комнаты к последней
+        for i = 1, #rooms do
+            local room = rooms[i]
+            local roomNodes = GetRoomNodes(room, false)
+            for _, node in ipairs(roomNodes) do
+                table.insert(pathfindNodes, node)
+            end
+        end
+    end
+    
+    return pathfindNodes
+end
+
+function PlayerInLineOfSight(model, config)
+    local origin = model:GetPivot().Position
+    local charOrigin = localRoot.Position
+    
+    local direction = (charOrigin - origin).Unit
+    local raycastParams = RaycastParams.new()
+    raycastParams.FilterType = Enum.RaycastFilterType.Blacklist
+    raycastParams.FilterDescendantsInstances = {model, localChar}
+    
+    local result = workspace:Raycast(origin, direction * config.Damage.Range, raycastParams)
+    
+    if result then
+        return result.Instance:IsDescendantOf(localChar)
+    end
+    
+    return false
+end
+
+function PlayerIsProtected()
+    return (tick() - lastRespawn) <= localPlayer:GetAttribute("SpawnProtection")
+end
+
+function DamagePlayer(entityTable)
+    if localHum.Health > 0 and not PlayerIsProtected() then
+        local config = entityTable.Config
+        local newHealth = math.clamp(localHum.Health - config.Damage.Amount, 0, localHum.MaxHealth)
+        
+        localHum.Health = newHealth
+        
+        if defaultDebug.OnDamagePlayer then
+            defaultDebug.OnDamagePlayer()
+        end
+    end
+end
+
+function EntityMoveTo(model, cframe, speed)
+    local reached = false
+    local connection
+    connection = RunService.Stepped:Connect(function(_, step)
+        if not model:GetAttribute("Paused") then
+            local pivot = model:GetPivot()
+            local difference = (cframe.Position - pivot.Position)
+            local unit = difference.Unit
+            local magnitude = difference.Magnitude
+            
+            if magnitude < 4 then
+                reached = true
+                connection:Disconnect()
+                return
+            end
+            
+            local moveStep = unit * speed * step
+            model:PivotTo(pivot + moveStep)
+            model:PivotTo(CFrame.lookAt(pivot.Position, cframe.Position))
+        end
+    end)
+    
+    repeat task.wait() until reached
+    return true
+end
+
+function ApplyConfigDefaults(tbl, defaults)
+    for key, value in defaults do
+        if tbl[key] == nil then
+            tbl[key] = value
+        elseif typeof(value) == "table" then
+            ApplyConfigDefaults(tbl[key], value)
+        end
+    end
+end
+
+function PrerunCheck(entityTable)
+    if entityTable.Attributes.Running or entityTable.Attributes.Despawning then
+        return false
+    end
+    
+    entityTable.Attributes.Running = true
+    return true
+end
+
+spawner.Create = function(config)
+    ApplyConfigDefaults(config, defaultConfig)
+    config.Movement.Speed = BaseEntitySpeed / 100 * config.Movement.Speed
+    
+    local entityTable = {
+        Config = config,
+        Model = nil,
+        Attributes = CloneTable(defaultEntityAttributes)
+    }
+    
+    return entityTable
+end
+
+spawner.Run = function(entityTable)
+    task.spawn(function()
+        if PrerunCheck(entityTable) == false then
+            return
+        end
+        
+        -- Загружаем модель entity
+        local model = entityTable.Model
+        if not model then
+            local assetUrl = entityTable.Config.Entity.Asset
+            model = LoadCustomInstance(assetUrl)
+            entityTable.Model = model
+        end
+        
+        model.Parent = workspace
+        
+        -- Получаем путь для движения
+        local pathNodes = GetPathfindNodes(entityTable.Config)
+        
+        -- Устанавливаем начальную позицию
+        if #pathNodes > 0 then
+            model:PivotTo(pathNodes[1].CFrame)
+        end
+        
+        -- Движение по нодам
+        for i = 1, #pathNodes do
+            if not entityTable.Attributes.Running or entityTable.Attributes.Despawning then
+                break
+            end
+            
+            local node = pathNodes[i]
+            EntityMoveTo(model, node.CFrame, entityTable.Config.Movement.Speed)
+            
+            -- Проверка на возможность атаки
+            if entityTable.Config.Damage.Enabled then
+                local distance = (model:GetPivot().Position - localRoot.Position).Magnitude
+                if distance <= entityTable.Config.Damage.Range and PlayerInLineOfSight(model, entityTable.Config) then
+                    DamagePlayer(entityTable)
+                end
+            end
+            
+            -- Задержка перед движением к следующей ноде
+            task.wait(entityTable.Config.Movement.Delay)
+        end
+        
+        -- Деспавн entity после прохождения всего пути
+        entityTable.Attributes.Despawning = true
+        if model then
+            model:Destroy()
+        end
+        entityTable.Attributes.Running = false
+    end)
+end
+
+-- Main
+localPlayer.CharacterAdded:Connect(OnCharacterAdded)
+
+for name, value in defaultPlayerAttributes do
+    localPlayer:SetAttribute(name, value)
+end
+lastRespawn = tick() - localPlayer:GetAttribute("SpawnProtection")
+
+if not vynixu_SpawnerLoaded then
+    getgenv().vynixu_SpawnerLoaded = true
+end
+
+-- Return spawner
+getgenv().VynixuEntitySpawnerV2 = spawner
+return spawner
